@@ -449,8 +449,8 @@ HAL_STEP_TIMER_ISR {
 
 void Stepper::isr() {
 
-  #define ENDSTOP_NOMINAL_OCR_VAL (int)(1500 * STEPPER_TIMER_TICKS_PER_US)  // Check endstops every 1.5ms to guarantee two stepper ISRs within 5ms for BLTouch
-  #define OCR_VAL_TOLERANCE       (int)( 500 * STEPPER_TIMER_TICKS_PER_US)  // First max delay is 2.0ms, last min delay is 0.5ms, all others 1.5ms
+  #define ENDSTOP_NOMINAL_OCR_VAL 3000  // Check endstops every 1.5ms to guarantee two stepper ISRs within 5ms for BLTouch
+  #define OCR_VAL_TOLERANCE       1000  // First max delay is 2.0ms, last min delay is 0.5ms, all others 1.5ms
 
   #if DISABLED(LIN_ADVANCE)
     // Allow UART ISRs
@@ -458,53 +458,70 @@ void Stepper::isr() {
   #endif
 
   hal_timer_t ocr_val;
-  static uint32_t step_remaining = 0;  // SPLIT function always runs.  This allows 16 bit timers to be
-                                       // used to generate the stepper ISR.
-  #define SPLIT(L) do { \
-    if (L > ENDSTOP_NOMINAL_OCR_VAL) { \
-      const uint32_t remainder = (uint32_t)L % (ENDSTOP_NOMINAL_OCR_VAL); \
-      ocr_val = (remainder < OCR_VAL_TOLERANCE) ? ENDSTOP_NOMINAL_OCR_VAL + remainder : ENDSTOP_NOMINAL_OCR_VAL; \
-      step_remaining = (uint32_t)L - ocr_val; \
-    } \
-    else \
-      ocr_val = L;\
-  } while(0)
 
-  // Time remaining before the next step?
-  if (step_remaining) {
+  #define _SPLIT(L) (ocr_val = (hal_timer_t)L)
 
-    // Make sure endstops are updated
-    if (ENDSTOPS_ENABLED) endstops.update();
+  #if ENABLED(ENDSTOP_INTERRUPTS_FEATURE)
+    #define SPLIT(L) _SPLIT(L)
+  #else  
+    static uint32_t step_remaining = 0; // SPLIT function always runs.  This allows 16 bit timers to be
+                                        // used to generate the stepper ISR.
+    #define SPLIT(L) do { \
+      _SPLIT(L); \
+      if (ENDSTOPS_ENABLED && L > ENDSTOP_NOMINAL_OCR_VAL) { \
+        const hal_timer_t remainder = (hal_timer_t)L % (ENDSTOP_NOMINAL_OCR_VAL); \
+        ocr_val = (remainder < OCR_VAL_TOLERANCE) ? ENDSTOP_NOMINAL_OCR_VAL + remainder : ENDSTOP_NOMINAL_OCR_VAL; \
+        step_remaining = (hal_timer_t)L - ocr_val; \
+      } \
+    } while(0)
 
-    // Next ISR either for endstops or stepping
-    ocr_val = step_remaining <= ENDSTOP_NOMINAL_OCR_VAL ? step_remaining : ENDSTOP_NOMINAL_OCR_VAL;
-    step_remaining -= ocr_val;
-    _NEXT_ISR(ocr_val);
+    // Time remaining before the next step?
+    if (step_remaining && ENDSTOPS_ENABLED) {
+      // Make sure endstops are updated
+      endstops.update();
 
-    #if DISABLED(LIN_ADVANCE)
+      // Next ISR either for endstops or stepping
+      ocr_val = step_remaining;
+      if (step_remaining > ENDSTOP_NOMINAL_OCR_VAL) {
+        step_remaining -= ENDSTOP_NOMINAL_OCR_VAL;
+        ocr_val = ENDSTOP_NOMINAL_OCR_VAL;
+      }
+      else {
+        ocr_val = step_remaining;
+        step_remaining = 0;  //  last one before the ISR that does the step
+      }
+
+      _NEXT_ISR(ocr_val);
+
       #if ENABLED(CPU_32_BIT)
-        HAL_timer_set_count(STEPPER_TIMER, ocr_val);
+        hal_timer_t stepper_timer_count         = HAL_timer_get_count(STEPPER_TIMER),
+                    stepper_timer_current_count = HAL_timer_get_current_count(STEPPER_TIMER) + 8 * STEPPER_TIMER_TICKS_PER_US;
+        HAL_timer_set_count(STEPPER_TIMER, stepper_timer_count < stepper_timer_current_count ? stepper_timer_current_count : stepper_timer_count);
       #else
         NOLESS(OCR1A, TCNT1 + 16);
       #endif
-      HAL_ENABLE_ISRs(); // re-enable ISRs
-    #endif
 
-    return;
-  }
+      HAL_ENABLE_ISRs(); // re-enable ISRs
+      return;
+    }
+  #endif
 
   //
   // When cleaning, discard the current block and run fast
   //
   if (cleaning_buffer_counter) {
-    --cleaning_buffer_counter;
+    if (cleaning_buffer_counter < 0)
+      ++cleaning_buffer_counter;                // Count up for endstop hit
+    else {
+      --cleaning_buffer_counter;                // Count down for abort print
+      #if SD_FINISHED_STEPPERRELEASE && ENABLED(SD_FINISHED_RELEASECOMMAND)
+        if (!cleaning_buffer_counter && (SD_FINISHED_STEPPERRELEASE)) commands.enqueue_and_echo_P(PSTR(SD_FINISHED_RELEASECOMMAND));
+      #endif
+    }
     current_block = NULL;
     planner.discard_current_block();
-    #if SD_FINISHED_STEPPERRELEASE && ENABLED(SD_FINISHED_RELEASECOMMAND)
-      if (!cleaning_buffer_counter) commands.enqueue_and_echo_P(PSTR(SD_FINISHED_RELEASECOMMAND));
-    #endif
     _NEXT_ISR(HAL_STEPPER_TIMER_RATE / 10000);  // Run at max speed - 10 KHz
-    HAL_ENABLE_ISRs(); // re-enable ISRs
+    HAL_ENABLE_ISRs();                          // re-enable ISRs
     return;
   }
 
@@ -605,7 +622,7 @@ void Stepper::isr() {
 
   // Take multiple steps per interrupt (For high speed moves)
   bool all_steps_done = false;
-  for (uint8_t i = step_loops; i--;) {
+  for (uint8_t step = step_loops; step--;) {
     #if ENABLED(LIN_ADVANCE)
 
       counter_E += current_block->steps[E_AXIS];
@@ -866,9 +883,9 @@ void Stepper::isr() {
 
     // For minimum pulse time wait after stopping pulses also
     #if EXTRA_CYCLES_XYZE > 20
-      if (i) while (EXTRA_CYCLES_XYZE > (uint32_t)(HAL_timer_get_current_count(PULSE_TIMER_NUM) - pulse_start) * (PULSE_TIMER_PRESCALE)) { /* nada */ }
+      if (step) while (EXTRA_CYCLES_XYZE > (uint32_t)(HAL_timer_get_current_count(PULSE_TIMER_NUM) - pulse_start) * (PULSE_TIMER_PRESCALE)) { /* nada */ }
     #elif EXTRA_CYCLES_XYZE > 0
-      if (i) DELAY_NOPS(EXTRA_CYCLES_XYZE);
+      if (step) DELAY_NOPS(EXTRA_CYCLES_XYZE);
     #endif
 
   } // step_loops
@@ -977,9 +994,9 @@ void Stepper::isr() {
   #if DISABLED(LIN_ADVANCE)
     #if ENABLED(CPU_32_BIT)
       // Make sure stepper interrupt does not monopolise CPU by adjusting count to give about 8 us room
-      hal_timer_t stepper_timer_count = HAL_timer_get_count(PULSE_TIMER_NUM),
-                  stepper_timer_current_count = HAL_timer_get_current_count(PULSE_TIMER_NUM) + 8 * STEPPER_TIMER_TICKS_PER_US;
-      HAL_timer_set_count(PULSE_TIMER_NUM, max(stepper_timer_count, stepper_timer_current_count));
+      hal_timer_t stepper_timer_count = HAL_timer_get_count(PULSE_TIMER_NUM);
+      NOLESS(stepper_timer_count, (HAL_timer_get_current_count(PULSE_TIMER_NUM) + 8 * STEPPER_TIMER_TICKS_PER_US));
+      HAL_timer_set_count(PULSE_TIMER_NUM, stepper_timer_count);
     #else
       NOLESS(OCR1A, TCNT1 + 16);
     #endif
@@ -1047,7 +1064,7 @@ void Stepper::isr() {
     #endif
 
     // Step all E steppers that have steps
-    for (uint8_t i = step_loops; i--;) {
+    for (uint8_t step = step_loops; step--;) {
 
       #if EXTRA_CYCLES_E > 20
         hal_timer_t pulse_start = HAL_timer_get_current_count(PULSE_TIMER_NUM);
@@ -1097,9 +1114,9 @@ void Stepper::isr() {
 
       // For minimum pulse time wait before looping
       #if EXTRA_CYCLES_E > 20
-        if (i) while (EXTRA_CYCLES_E > (hal_timer_t)(HAL_timer_get_current_count(PULSE_TIMER_NUM) - pulse_start) * PULSE_TIMER_PRESCALE) { /* noop */ }
+        if (step) while (EXTRA_CYCLES_E > (hal_timer_t)(HAL_timer_get_current_count(PULSE_TIMER_NUM) - pulse_start) * PULSE_TIMER_PRESCALE) { /* noop */ }
       #elif EXTRA_CYCLES_E > 0
-        if (i) DELAY_NOPS(EXTRA_CYCLES_E);
+        if (step) DELAY_NOPS(EXTRA_CYCLES_E);
       #endif
 
     } // step_loops
@@ -1140,7 +1157,7 @@ void Stepper::isr() {
       // Make sure stepper interrupt does not monopolise CPU by adjusting count to give about 8 us room
       hal_timer_t stepper_timer_count = HAL_timer_get_count(PULSE_TIMER_NUM),
                   stepper_timer_current_count = HAL_timer_get_current_count(PULSE_TIMER_NUM) + 8 * STEPPER_TIMER_TICKS_PER_US;
-      HAL_timer_set_count(PULSE_TIMER_NUM, max(stepper_timer_count, stepper_timer_current_count));
+      HAL_TIMER_SET_STEPPER_COUNT(stepper_timer_count < stepper_timer_current_count ? stepper_timer_current_count : stepper_timer_count);
     #else
       NOLESS(OCR1A, TCNT1 + 16);
     #endif
