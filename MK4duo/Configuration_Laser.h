@@ -38,7 +38,7 @@
 // Please choose the one that matches your setup.
 // 1 = Single pin control - LASER_PWR_PIN LOW when off, HIGH when on, PWM to adjust intensity
 // 2 = Two pin control    - LASER_PWR_PIN for which LOW = off, HIGH = on, and a seperate LASER_PWM_PIN which carries a constant PWM signal and adjusts duty cycle to control intensity
-#define LASER_CONTROL 1
+#define LASER_CONTROL 2
 
 // In the case that the laserdriver need at least a certain level "LASER_REMAP_INTENSITY"
 // to give anything, the intensity can be remapped to start at "LASER_REMAP_INTENSITY"
