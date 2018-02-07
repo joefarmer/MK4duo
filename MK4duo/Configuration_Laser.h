@@ -54,7 +54,7 @@
 // #define HIGH_TO_FIRE
 
 // Uncomment the following if your laser pwm pin (not the power pin) needs to be inverted.
-//#define LASER_PWM_INVERT
+#define LASER_PWM_INVERT
 
 // The following defines select which G codes tell the laser to fire. It's OK to uncomment more than one.
 #define LASER_FIRE_SPINDLE    // fire the laser on M3, extinguish on M5
